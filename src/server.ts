@@ -3,6 +3,8 @@ import express, {
   type Request,
   type Response,
 } from "express";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { config } from "./config.js";
 import type { Pool } from "./db.js";
 import { createEndpoint, ingestEvent, replayDelivery } from "./events.js";
 
@@ -24,18 +26,65 @@ function isHttpUrl(value: unknown): value is string {
   }
 }
 
-export function createApp(pool: Pool) {
-  const app = express();
-  app.use(express.json({ limit: "256kb" }));
+const sha256 = (s: string) => createHash("sha256").update(s).digest();
 
-  // Open CORS so the dashboard dev server can call the API.
+/**
+ * Writes that create work or make the server call a URL need the API key: an
+ * open POST /endpoints would let anyone aim our workers at any address. Hashing
+ * first gives timingSafeEqual equal-length inputs whatever the caller sends.
+ */
+function requireApiKey(apiKey: string | undefined) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    if (apiKey === undefined) return next();
+    const given = req.header("authorization")?.replace(/^Bearer /i, "") ?? "";
+    if (timingSafeEqual(sha256(given), sha256(apiKey))) return next();
+    res.status(401).json({ error: "missing or invalid API key" });
+  };
+}
+
+/**
+ * At most `limit` calls per minute across ALL callers. Global rather than
+ * per-IP on purpose: proxies make client IPs easy to spoof, and all this
+ * protects is a demo button.
+ */
+function rateLimit(limit: number) {
+  let windowStart = 0;
+  let used = 0;
+  return (_req: Request, res: Response, next: NextFunction) => {
+    const now = Date.now();
+    if (now - windowStart >= 60_000) {
+      windowStart = now;
+      used = 0;
+    }
+    if (++used > limit) {
+      return res.status(429).json({ error: "too many replays, try again in a minute" });
+    }
+    next();
+  };
+}
+
+export interface AppOptions {
+  apiKey?: string;
+  replayPerMinute?: number;
+}
+
+export function createApp(pool: Pool, options: AppOptions = {}) {
+  const apiKey = options.apiKey ?? config.apiKey;
+  const auth = requireApiKey(apiKey);
+  const replayLimit = rateLimit(options.replayPerMinute ?? config.replayPerMinute);
+
+  const app = express();
+
+  // Open CORS: the dashboard is hosted on a different origin than the API, and
+  // the API authenticates with a header rather than cookies.
   app.use((req, res, next) => {
     res.setHeader("access-control-allow-origin", "*");
-    res.setHeader("access-control-allow-headers", "content-type,idempotency-key");
+    res.setHeader("access-control-allow-headers", "content-type,idempotency-key,authorization");
     res.setHeader("access-control-allow-methods", "GET,POST,OPTIONS");
     if (req.method === "OPTIONS") return res.sendStatus(204);
     next();
   });
+  app.use(express.json({ limit: "256kb" }));
 
   app.get("/health", wrap(async (_req, res) => {
     await pool.query("SELECT 1");
@@ -43,7 +92,7 @@ export function createApp(pool: Pool) {
   }));
 
   // --- endpoints ---------------------------------------------------------
-  app.post("/endpoints", wrap(async (req, res) => {
+  app.post("/endpoints", auth, wrap(async (req, res) => {
     const { url, name, secret, eventTypes } = req.body ?? {};
     if (!isHttpUrl(url)) return res.status(400).json({ error: "url must be http(s)" });
     if (name !== undefined && typeof name !== "string") {
@@ -68,7 +117,7 @@ export function createApp(pool: Pool) {
   }));
 
   // --- events ------------------------------------------------------------
-  app.post("/events", wrap(async (req, res) => {
+  app.post("/events", auth, wrap(async (req, res) => {
     const { type, payload } = req.body ?? {};
     const idempotencyKey =
       (req.header("idempotency-key") as string | undefined) ??
@@ -142,7 +191,7 @@ export function createApp(pool: Pool) {
     res.json(rows);
   }));
 
-  app.post("/deliveries/:id/replay", wrap(async (req, res) => {
+  app.post("/deliveries/:id/replay", replayLimit, wrap(async (req, res) => {
     const id = String(req.params.id);
     if (!UUID.test(id)) return res.status(400).json({ error: "bad id" });
     const ok = await replayDelivery(pool, id);

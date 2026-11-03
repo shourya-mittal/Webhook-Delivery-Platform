@@ -4,6 +4,12 @@ import { migrate } from "./migrate.js";
 import { createApp } from "./server.js";
 import { startWorker } from "./worker.js";
 
+// Fail closed: never run a production API with its write endpoints open.
+if (process.env.NODE_ENV === "production" && !config.apiKey) {
+  console.error("API_KEY is required when NODE_ENV=production");
+  process.exit(1);
+}
+
 const pool = createPool();
 await migrate(pool);
 

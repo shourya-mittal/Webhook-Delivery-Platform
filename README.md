@@ -171,6 +171,25 @@ docker compose up --build    # Postgres + API/worker on :3000
 npm run dashboard            # dashboard against it
 ```
 
+`docker compose down` stops it and keeps the data; add `-v` to delete the data
+too. The Compose Postgres and the `scripts/dev-env.ps1` Postgres both use port
+5433, so run one at a time (`. .\scripts\dev-env.ps1 -Stop` stops the local one).
+
+### Hosting the demo
+
+The hosted demo runs on free tiers. It is the same school-bus demo, not a
+production deployment:
+
+| Part | Host | Notes |
+|---|---|---|
+| API, worker, bus, receivers | Render ([`render.yaml`](render.yaml)) | One process with `DEMO_PUBLIC=1`. Sleeps after 15 idle minutes and takes about a minute to wake. |
+| Postgres | Neon | **Wiped on every start**, so use a database dedicated to the demo. Data older than 30 minutes is pruned. |
+| Dashboard | Vercel | Root directory `dashboard`, with `VITE_API_BASE` set to the Render URL. Polling pauses when the tab is hidden or idle for 15 minutes, so the server and database can sleep. |
+
+Visitors can look around and press Replay (capped at 30 per minute). They can't
+send events or register URLs, because writes need a random key generated inside
+the process at startup.
+
 ## API
 
 | Method | Path | Purpose |
@@ -185,14 +204,18 @@ npm run dashboard            # dashboard against it
 | `GET` | `/stats` | Dashboard data: status counts, latency, per-minute timeline, per-endpoint health |
 | `GET` | `/health` | Liveness, including a database round-trip |
 
+When `API_KEY` is set, `POST /events` and `POST /endpoints` need an
+`Authorization: Bearer <key>` header. It is required when
+`NODE_ENV=production`, and optional for local development.
+
 Configuration (environment variables, defaults in `src/config.ts`):
-`DATABASE_URL`, `PORT`, `MAX_ATTEMPTS` (5), `BASE_DELAY_MS` (5 s),
+`DATABASE_URL`, `PORT`, `API_KEY`, `REPLAY_PER_MINUTE` (30), `MAX_ATTEMPTS` (5), `BASE_DELAY_MS` (5 s),
 `MAX_DELAY_MS` (15 min), `REQUEST_TIMEOUT_MS` (10 s), `LEASE_MS` (30 s),
 `POLL_INTERVAL_MS`, `BATCH_SIZE`.
 
 ## Tests
 
-`npm test` runs 15 tests with Vitest against a real PostgreSQL database
+`npm test` runs 20 tests with Vitest against a real PostgreSQL database
 (`webhook_test`). Most of them cover failure paths:
 
 - receiver returns errors, then recovers → retried until it succeeds
@@ -207,6 +230,7 @@ Configuration (environment variables, defaults in `src/config.ts`):
 - backoff grows exponentially, stays under the cap and applies jitter
 - malformed / oversized request bodies → `400` / `413`, not `500`
 - dashboard stats: status counts, per-endpoint health, gap-free timeline
+- writes without the API key → `401`; too many replays → `429`
 
 ## Project layout
 
@@ -225,8 +249,12 @@ These are deliberately out of scope, and worth knowing about:
 - **One process runs the API and the worker.** Workers only talk to Postgres,
   so running more worker processes is safe (that's what `SKIP LOCKED` and the
   leases are for). It just isn't packaged as a separate command yet.
-- **No authentication** on the API or the dashboard. It's meant for a trusted
-  network.
+- **One shared API key, and only for writes.** Reads are public, and replay is
+  public but rate limited. There are no user accounts or per-tenant isolation.
+- **Registered URLs aren't filtered.** Anyone holding the API key can point
+  workers at any address, including internal ones. On the hosted demo nobody
+  outside the process has the key, but a real multi-tenant service would need
+  to block private address ranges.
 - **Endpoint secrets are stored in plain text** and there is no secret rotation.
 - **No per-endpoint rate limiting or circuit breaker.** Backoff with jitter
   softens retry storms but doesn't cap concurrency per receiver.

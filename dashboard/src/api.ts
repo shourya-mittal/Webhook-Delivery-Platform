@@ -1,4 +1,6 @@
 // Typed client for the platform API (see src/server.ts in the backend).
+// VITE_API_BASE is set only on the hosted demo, where the API is on another origin.
+export const IS_HOSTED_DEMO = Boolean(import.meta.env.VITE_API_BASE);
 const BASE = import.meta.env.VITE_API_BASE ?? "/api";
 
 export type DeliveryStatus = "pending" | "in_flight" | "succeeded" | "dead";
@@ -45,9 +47,11 @@ export interface Attempt {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, init);
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+  const res = await fetch(`${BASE}${path}`, { signal: AbortSignal.timeout(20_000), ...init });
+  // A sleeping host can answer with its own non-JSON page while it wakes up.
+  const body = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`);
+  if (body === null) throw new Error("API returned a non-JSON response");
   return body as T;
 }
 

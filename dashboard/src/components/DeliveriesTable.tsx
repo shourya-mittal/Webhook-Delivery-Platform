@@ -43,12 +43,12 @@ function AttemptLog({ deliveryId, attemptCount }: { deliveryId: string; attemptC
   );
 }
 
-export function DeliveriesTable({ now, onReplayed }: { now: number; onReplayed: () => void }) {
+export function DeliveriesTable({ now, active, onReplayed }: { now: number; active: boolean; onReplayed: () => void }) {
   const [filter, setFilter] = useState<DeliveryStatus | undefined>(undefined);
   const [open, setOpen] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const { data, refresh } = usePoll(() => api.deliveries(filter), 2000);
+  const { data, refresh } = usePoll(() => api.deliveries(filter), 2000, active);
 
   useEffect(() => { void refresh(); }, [filter, refresh]);
 
@@ -129,8 +129,10 @@ export function DeliveriesTable({ now, onReplayed }: { now: number; onReplayed: 
                   <td className="muted truncate" title={d.lastError ?? undefined}>{d.lastError ?? "—"}</td>
                   <td className="muted nowrap">
                     {d.status === "pending" && d.attemptCount > 0
-                      ? `next try ${relativeTime(d.nextAttemptAt, now)}`
-                      : relativeTime(d.updatedAt, now)}
+                      ? Date.parse(d.nextAttemptAt) > now
+                        ? `next try ${relativeTime(d.nextAttemptAt, now)}`
+                        : "next try now"
+                      : relativeTime(d.updatedAt, Math.max(now, Date.parse(d.updatedAt)))}
                   </td>
                   <td className="actions">
                     {d.status === "dead" && (

@@ -1,0 +1,16 @@
+# Render Blueprint for the hosted demo: API, worker, simulated bus and receivers
+# in one free web service. The dashboard is hosted separately on Vercel.
+services:
+  - type: web
+    name: webhook-delivery-demo
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerCommand: node --import tsx scripts/demo.ts
+    healthCheckPath: /health
+    envVars:
+      - key: DEMO_PUBLIC
+        value: "1"
+      # WIPED on every start: use a database dedicated to this demo.
+      - key: DATABASE_URL
+        sync: false

@@ -2,6 +2,11 @@ export const config = {
   databaseUrl:
     process.env.DATABASE_URL ?? "postgres://postgres@localhost:5433/postgres",
   port: Number(process.env.PORT ?? 3000),
+  // When set, POST /events and POST /endpoints require this key. Required when
+  // NODE_ENV=production; left unset for local development.
+  apiKey: process.env.API_KEY || undefined,
+  // Replay is public on the hosted demo, so it is capped across all callers.
+  replayPerMinute: Number(process.env.REPLAY_PER_MINUTE ?? 30),
   // Delivery policy
   maxAttempts: Number(process.env.MAX_ATTEMPTS ?? 5),
   baseDelayMs: Number(process.env.BASE_DELAY_MS ?? 5000),

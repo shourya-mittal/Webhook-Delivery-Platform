@@ -1,5 +1,8 @@
 node_modules
 dist
 test
-scripts
+dashboard
+docs
+.tools
+.git
 *.log

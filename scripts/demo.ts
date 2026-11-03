@@ -13,9 +13,16 @@
 //
 // Uses its own database (webhook_demo), wiped on every start. All data is
 // simulated.
+//
+// DEMO_PUBLIC=1 is the hosted version: it listens on all interfaces and uses
+// DATABASE_URL as given, which it WIPES on every start. Point it only at a
+// database dedicated to this demo. Receivers stay on loopback, and writes need
+// a random key only this process knows, so visitors can look and replay but
+// can't send events or register URLs.
+import { randomBytes } from "node:crypto";
 import http from "node:http";
-import pg from "pg";
 import { config, type Config } from "../src/config.js";
+import { createPool, type Pool } from "../src/db.js";
 import { createEndpoint } from "../src/events.js";
 import { migrate } from "../src/migrate.js";
 import { createApp } from "../src/server.js";
@@ -23,6 +30,11 @@ import { verify } from "../src/signing.js";
 import { startWorker } from "../src/worker.js";
 
 const DEMO_DB = "webhook_demo";
+const PUBLIC = process.env.DEMO_PUBLIC === "1";
+const HOST = PUBLIC ? "0.0.0.0" : "127.0.0.1";
+const API_KEY = randomBytes(32).toString("hex");
+// The dashboard only charts 30 minutes, so older data can go.
+const KEEP_MINUTES = 30;
 const API_PORT = Number(process.env.PORT ?? 3000);
 const OUTAGE_MS = Number(process.env.OUTAGE_MS ?? 40_000);
 const UPTIME_MS = Number(process.env.UPTIME_MS ?? 45_000);
@@ -44,15 +56,16 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const log = (who: string, msg: string) =>
   console.log(`${new Date().toLocaleTimeString()}  ${who.padEnd(14)} ${msg}`);
 
-async function demoPool(): Promise<pg.Pool> {
-  const admin = new pg.Pool({ connectionString: config.databaseUrl, max: 1 });
-  const exists = await admin.query(`SELECT 1 FROM pg_database WHERE datname = $1`, [DEMO_DB]);
-  if (exists.rowCount === 0) await admin.query(`CREATE DATABASE ${DEMO_DB}`);
-  await admin.end();
-  const pool = new pg.Pool({
-    connectionString: config.databaseUrl.replace(/\/[^/]*$/, `/${DEMO_DB}`),
-    max: 10,
-  });
+async function demoPool(): Promise<Pool> {
+  let url = config.databaseUrl;
+  if (!PUBLIC) {
+    const admin = createPool(url);
+    const exists = await admin.query(`SELECT 1 FROM pg_database WHERE datname = $1`, [DEMO_DB]);
+    if (exists.rowCount === 0) await admin.query(`CREATE DATABASE ${DEMO_DB}`);
+    await admin.end();
+    url = url.replace(/\/[^/]*$/, `/${DEMO_DB}`);
+  }
+  const pool = createPool(url);
   await migrate(pool);
   await pool.query(`TRUNCATE attempts, deliveries, events, endpoints CASCADE`);
   return pool;
@@ -146,12 +159,18 @@ async function main() {
     secrets[e.key] = created.secret;
   }
 
-  const server = createApp(pool).listen(API_PORT, "127.0.0.1");
+  const server = createApp(pool, { apiKey: API_KEY }).listen(API_PORT, HOST);
   await new Promise((r) => server.once("listening", r));
   const worker = startWorker(pool, demoConfig);
   log("platform", `API on http://localhost:${API_PORT}, worker running, database ${DEMO_DB}`);
-  log("platform", `dashboard: run \`npm run dashboard\` and open http://localhost:5173`);
+  if (!PUBLIC) log("platform", `dashboard: run \`npm run dashboard\` and open http://localhost:5173`);
   void cycle();
+
+  const prune = setInterval(() => {
+    pool
+      .query(`DELETE FROM events WHERE created_at < now() - ($1 * interval '1 minute')`, [KEEP_MINUTES])
+      .catch((err) => log("platform", `prune failed: ${err.message}`));
+  }, 60_000);
 
   // The bus drives its route on a loop, publishing an event at each stop.
   let running = true;
@@ -173,15 +192,27 @@ async function main() {
       const post = () =>
         fetch(`http://127.0.0.1:${API_PORT}/events`, {
           method: "POST",
-          headers: { "content-type": "application/json", "idempotency-key": key },
+          headers: {
+            "content-type": "application/json",
+            "idempotency-key": key,
+            authorization: `Bearer ${API_KEY}`,
+          },
           body: JSON.stringify(event),
-        }).then((r) => r.json() as Promise<{ eventId: string; duplicate: boolean }>);
-      const res = await post();
-      log("bus-12", `arrived at ${stop} → event ${res.eventId.slice(0, 8)}`);
-      // Every so often the bus's flaky uplink resends; the key makes it a no-op.
-      if (n % 5 === 4) {
-        const again = await post();
-        log("bus-12", `resent same event (uplink retry) → duplicate=${again.duplicate}, no new deliveries`);
+        }).then(async (r) => {
+          if (!r.ok) throw new Error(`API answered ${r.status}`);
+          return r.json() as Promise<{ eventId: string; duplicate: boolean }>;
+        });
+      // A hosted database can blip; the bus logs it and carries on with its route.
+      try {
+        const res = await post();
+        log("bus-12", `arrived at ${stop} → event ${res.eventId.slice(0, 8)}`);
+        // Every so often the bus's flaky uplink resends; the key makes it a no-op.
+        if (n % 5 === 4) {
+          const again = await post();
+          log("bus-12", `resent same event (uplink retry) → duplicate=${again.duplicate}, no new deliveries`);
+        }
+      } catch (err) {
+        log("bus-12", `could not publish: ${(err as Error).message}`);
       }
       await sleep(BUS_INTERVAL_MS);
     }
@@ -190,6 +221,7 @@ async function main() {
   const shutdown = async () => {
     log("platform", "shutting down");
     running = false;
+    clearInterval(prune);
     server.close();
     receivers.forEach((r) => r.closeAllConnections());
     await worker.stop();
