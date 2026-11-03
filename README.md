@@ -8,6 +8,10 @@ down or flaky.** Every attempt is logged, failures are retried with
 exponential backoff and jitter, deliveries that run out of retries go to a
 dead-letter state, and an operator can replay them from a dashboard.
 
+**[Try the live demo](https://webhook-delivery-platform.vercel.app/)** (all data
+is simulated). It runs on free hosting that sleeps when idle, so the first visit
+can take about a minute to wake up.
+
 Built from scratch in TypeScript, Node.js and PostgreSQL. Svix and Hookdeck
 Outpost were used only as architecture references.
 
