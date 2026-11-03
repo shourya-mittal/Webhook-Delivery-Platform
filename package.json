@@ -10,7 +10,10 @@
     "dev": "tsx src/index.ts",
     "migrate": "tsx src/migrate.ts",
     "build": "tsc -p tsconfig.json",
-    "test": "vitest run"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "demo": "tsx scripts/demo.ts",
+    "dashboard": "npm --prefix dashboard run dev"
   },
   "dependencies": {
     "express": "^5.3.0",

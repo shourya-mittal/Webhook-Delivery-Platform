@@ -1,5 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type pg from "pg";
+import type { AddressInfo } from "node:net";
+import { createApp } from "../src/server.js";
 import { createEndpoint, ingestEvent, replayDelivery } from "../src/events.js";
 import { claimDue, processBatch, settle } from "../src/worker.js";
 import { verify } from "../src/signing.js";
@@ -215,6 +217,43 @@ describe("concurrency and duplicates", () => {
     );
     expect(new Set(results.map((r) => r.eventId)).size).toBe(1);
     expect(results.filter((r) => !r.duplicate)).toHaveLength(1);
+  });
+});
+
+describe("dashboard stats", () => {
+  it("reports status counts, per-endpoint health and a gap-free timeline", async () => {
+    const good = await startReceiver();
+    const bad = await startReceiver(() => 503);
+    await createEndpoint(pool, { url: good.url, name: "good" });
+    await createEndpoint(pool, { url: bad.url, name: "bad" });
+    await ingestEvent(pool, { type: "t", payload: {} });
+    await drainUntil(pool, async () => {
+      const { rows } = await pool.query(
+        `SELECT count(*)::int AS n FROM deliveries WHERE status IN ('succeeded','dead')`,
+      );
+      return rows[0].n === 2;
+    });
+
+    const server = createApp(pool).listen(0, "127.0.0.1");
+    await new Promise((r) => server.once("listening", r));
+    const port = (server.address() as AddressInfo).port;
+    const stats = await (await fetch(`http://127.0.0.1:${port}/stats`)).json();
+    await new Promise((r) => server.close(r));
+
+    expect(stats.deliveries).toMatchObject({ succeeded: 1, dead: 1 });
+    expect(stats.endpoints).toEqual([
+      expect.objectContaining({ name: "good", succeeded: 1, retrying: 0, dead: 0 }),
+      expect.objectContaining({ name: "bad", succeeded: 0, retrying: 0, dead: 1 }),
+    ]);
+    expect(stats.timeline).toHaveLength(30);
+    // Summed, so the test holds even if it straddles a minute boundary.
+    const sum = (k: string) =>
+      stats.timeline.reduce((n: number, m: Record<string, number>) => n + m[k]!, 0);
+    expect(sum("events")).toBe(1);
+    expect(sum("okAttempts")).toBe(1);
+    expect(sum("failedAttempts")).toBe(testConfig.maxAttempts);
+    await good.close();
+    await bad.close();
   });
 });
 

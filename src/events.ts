@@ -77,6 +77,7 @@ export async function ingestEvent(
 
 export interface EndpointInput {
   url: string;
+  name?: string;
   secret?: string;
   eventTypes?: string[];
 }
@@ -84,10 +85,10 @@ export interface EndpointInput {
 export async function createEndpoint(pool: Pool, input: EndpointInput) {
   const secret = input.secret ?? `whsec_${randomBytes(24).toString("hex")}`;
   const { rows } = await pool.query(
-    `INSERT INTO endpoints (url, secret, event_types)
-     VALUES ($1, $2, $3)
-     RETURNING id, url, secret, event_types AS "eventTypes", active, created_at AS "createdAt"`,
-    [input.url, secret, input.eventTypes ?? []],
+    `INSERT INTO endpoints (url, name, secret, event_types)
+     VALUES ($1, $2, $3, $4)
+     RETURNING id, url, name, secret, event_types AS "eventTypes", active, created_at AS "createdAt"`,
+    [input.url, input.name ?? null, secret, input.eventTypes ?? []],
   );
   return rows[0];
 }

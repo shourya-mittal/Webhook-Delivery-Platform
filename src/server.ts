@@ -44,21 +44,24 @@ export function createApp(pool: Pool) {
 
   // --- endpoints ---------------------------------------------------------
   app.post("/endpoints", wrap(async (req, res) => {
-    const { url, secret, eventTypes } = req.body ?? {};
+    const { url, name, secret, eventTypes } = req.body ?? {};
     if (!isHttpUrl(url)) return res.status(400).json({ error: "url must be http(s)" });
+    if (name !== undefined && typeof name !== "string") {
+      return res.status(400).json({ error: "name must be a string" });
+    }
     if (
       eventTypes !== undefined &&
       !(Array.isArray(eventTypes) && eventTypes.every((t) => typeof t === "string"))
     ) {
       return res.status(400).json({ error: "eventTypes must be an array of strings" });
     }
-    const endpoint = await createEndpoint(pool, { url, secret, eventTypes });
+    const endpoint = await createEndpoint(pool, { url, name, secret, eventTypes });
     res.status(201).json(endpoint);
   }));
 
   app.get("/endpoints", wrap(async (_req, res) => {
     const { rows } = await pool.query(
-      `SELECT id, url, event_types AS "eventTypes", active, created_at AS "createdAt"
+      `SELECT id, url, name, event_types AS "eventTypes", active, created_at AS "createdAt"
          FROM endpoints ORDER BY created_at`,
     );
     res.json(rows);
@@ -114,7 +117,8 @@ export function createApp(pool: Pool) {
       `SELECT d.id, d.status, d.attempt_count AS "attemptCount",
               d.next_attempt_at AS "nextAttemptAt", d.last_error AS "lastError",
               d.updated_at AS "updatedAt",
-              ev.id AS "eventId", ev.type, ep.url
+              ev.id AS "eventId", ev.type,
+              ep.id AS "endpointId", ep.url, ep.name AS "endpointName"
          FROM deliveries d
          JOIN events ev    ON ev.id = d.event_id
          JOIN endpoints ep ON ep.id = d.endpoint_id
@@ -159,16 +163,55 @@ export function createApp(pool: Pool) {
               coalesce(percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms), 0)::int AS "p95Ms"
          FROM attempts WHERE attempted_at > now() - interval '1 hour'`,
     );
-    const volume = await pool.query(
-      `SELECT date_trunc('minute', created_at) AS minute, count(*)::int AS events
-         FROM events WHERE created_at > now() - interval '1 hour'
-        GROUP BY 1 ORDER BY 1`,
+    // One row per minute for the last 30 minutes, gaps filled with zeros, so
+    // the dashboard can plot event volume and attempt outcomes directly.
+    const timeline = await pool.query(
+      `WITH minutes AS (
+         SELECT generate_series(
+                  date_trunc('minute', now()) - interval '29 minutes',
+                  date_trunc('minute', now()),
+                  interval '1 minute') AS minute
+       ), ev AS (
+         SELECT date_trunc('minute', created_at) AS minute, count(*)::int AS n
+           FROM events WHERE created_at > now() - interval '30 minutes'
+          GROUP BY 1
+       ), att AS (
+         SELECT date_trunc('minute', attempted_at) AS minute,
+                count(*) FILTER (WHERE status_code BETWEEN 200 AND 299)::int AS ok,
+                count(*) FILTER (WHERE status_code IS NULL OR status_code NOT BETWEEN 200 AND 299)::int AS failed
+           FROM attempts WHERE attempted_at > now() - interval '30 minutes'
+          GROUP BY 1
+       )
+       SELECT m.minute,
+              coalesce(ev.n, 0)      AS events,
+              coalesce(att.ok, 0)     AS "okAttempts",
+              coalesce(att.failed, 0) AS "failedAttempts"
+         FROM minutes m
+         LEFT JOIN ev  ON ev.minute = m.minute
+         LEFT JOIN att ON att.minute = m.minute
+        ORDER BY m.minute`,
+    );
+    // Per-endpoint health: where are deliveries piling up?
+    const endpoints = await pool.query(
+      `SELECT ep.id, ep.name, ep.url,
+              count(d.*) FILTER (WHERE d.status = 'succeeded')::int AS succeeded,
+              count(d.*) FILTER (WHERE d.status IN ('pending','in_flight'))::int AS retrying,
+              count(d.*) FILTER (WHERE d.status = 'dead')::int AS dead
+         FROM endpoints ep
+         LEFT JOIN deliveries d ON d.endpoint_id = ep.id
+        GROUP BY ep.id
+        ORDER BY ep.created_at`,
     );
     const counts: Record<string, number> = {
       pending: 0, in_flight: 0, succeeded: 0, dead: 0,
     };
     for (const r of byStatus.rows) counts[r.status] = r.count;
-    res.json({ deliveries: counts, lastHour: latency.rows[0], volume: volume.rows });
+    res.json({
+      deliveries: counts,
+      lastHour: latency.rows[0],
+      timeline: timeline.rows,
+      endpoints: endpoints.rows,
+    });
   }));
 
   // Error handler: never leak internals.

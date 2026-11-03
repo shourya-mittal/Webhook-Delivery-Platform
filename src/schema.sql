@@ -13,6 +13,9 @@ CREATE TABLE IF NOT EXISTS endpoints (
   created_at  timestamptz NOT NULL DEFAULT now()
 );
 
+-- Human-readable label for the dashboard (added after v0.1; nullable).
+ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS name text;
+
 CREATE TABLE IF NOT EXISTS events (
   id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   idempotency_key text UNIQUE,               -- sender-supplied; dedupes ingestion
