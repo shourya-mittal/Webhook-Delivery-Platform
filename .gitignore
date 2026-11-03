@@ -8,3 +8,5 @@ coverage/
 !.env.example
 *.log
 .DS_Store
+# Machine-specific preview config (absolute paths)
+.claude/

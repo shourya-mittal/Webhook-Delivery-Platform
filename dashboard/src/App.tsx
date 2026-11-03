@@ -29,7 +29,9 @@ export function App() {
             : waking
               ? "Waking up…"
               : stats.error
-                ? `API unreachable (${stats.error}), retrying`
+                ? IS_HOSTED_DEMO
+                  ? "Reconnecting…"
+                  : `API unreachable (${stats.error}), retrying`
                 : stats.updatedAt
                   ? `Live · updated ${relativeTime(new Date(stats.updatedAt).toISOString(), Math.max(now, stats.updatedAt))}`
                   : "Connecting…"}

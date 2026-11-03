@@ -67,6 +67,14 @@ async function demoPool(): Promise<Pool> {
   }
   const pool = createPool(url);
   await migrate(pool);
+  // Starting wipes the database, so refuse if it holds anything but demo data:
+  // a wrong DATABASE_URL should fail loudly, not destroy someone's data.
+  const foreign = await pool.query(
+    `SELECT 1 FROM endpoints WHERE url !~ '^http://127\\.0\\.0\\.1:400[123]/' LIMIT 1`,
+  );
+  if (foreign.rowCount) {
+    throw new Error("Refusing to wipe: this database has endpoints the demo did not create.");
+  }
   await pool.query(`TRUNCATE attempts, deliveries, events, endpoints CASCADE`);
   return pool;
 }

@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            dashboard/package-lock.json
+
+      - name: Backend install
+        run: npm ci --no-audit --no-fund
+      - name: Backend typecheck
+        run: npm run typecheck
+      - name: Failure-path tests (real Postgres)
+        run: npm test
+
+      - name: Dashboard install
+        run: npm ci --no-audit --no-fund
+        working-directory: dashboard
+      - name: Dashboard build
+        run: npm run build
+        working-directory: dashboard
+
+      - name: Docker image builds
+        run: docker build -t webhook-platform .

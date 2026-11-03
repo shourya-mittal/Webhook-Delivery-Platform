@@ -7,6 +7,8 @@ export const config = {
   apiKey: process.env.API_KEY || undefined,
   // Replay is public on the hosted demo, so it is capped across all callers.
   replayPerMinute: Number(process.env.REPLAY_PER_MINUTE ?? 30),
+  // A dashboard tab makes about 60 requests a minute, so this is roughly 50 tabs.
+  requestsPerMinute: Number(process.env.REQUESTS_PER_MINUTE ?? 3000),
   // Delivery policy
   maxAttempts: Number(process.env.MAX_ATTEMPTS ?? 5),
   baseDelayMs: Number(process.env.BASE_DELAY_MS ?? 5000),

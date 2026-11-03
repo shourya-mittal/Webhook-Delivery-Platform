@@ -7,10 +7,14 @@ services:
     plan: free
     region: oregon
     dockerCommand: node --import tsx scripts/demo.ts
-    healthCheckPath: /health
+    # /live, not /health: a database blip must not trigger a restart, because
+    # every restart of the demo wipes its data.
+    healthCheckPath: /live
     envVars:
       - key: DEMO_PUBLIC
         value: "1"
+      - key: NODE_ENV
+        value: production
       # WIPED on every start: use a database dedicated to this demo.
       - key: DATABASE_URL
         sync: false

@@ -44,10 +44,10 @@ function requireApiKey(apiKey: string | undefined) {
 
 /**
  * At most `limit` calls per minute across ALL callers. Global rather than
- * per-IP on purpose: proxies make client IPs easy to spoof, and all this
- * protects is a demo button.
+ * per-IP on purpose: proxies make client IPs easy to spoof, and what this
+ * protects is a small demo's free-tier quota.
  */
-function rateLimit(limit: number) {
+function rateLimit(limit: number, message: string) {
   let windowStart = 0;
   let used = 0;
   return (_req: Request, res: Response, next: NextFunction) => {
@@ -57,23 +57,58 @@ function rateLimit(limit: number) {
       used = 0;
     }
     if (++used > limit) {
-      return res.status(429).json({ error: "too many replays, try again in a minute" });
+      return res.status(429).json({ error: message });
     }
     next();
   };
 }
 
+/**
+ * Share one result for `ttlMs`, and one in-progress query between concurrent
+ * callers, so more viewers don't mean more database load. Failures aren't kept.
+ */
+function microCache<T>(ttlMs: number, load: () => Promise<T>): () => Promise<T> {
+  let value: Promise<T> | undefined;
+  let expires = 0;
+  return () => {
+    if (value && Date.now() < expires) return value;
+    expires = Date.now() + ttlMs;
+    const current = load().catch((err) => {
+      if (value === current) value = undefined;
+      throw err;
+    });
+    value = current;
+    return current;
+  };
+}
+
+// Input caps: the body limit alone would still allow a 256 KB event type.
+const MAX_TEXT = 255;
+const MAX_URL = 2048;
+const tooLong = (value: unknown, max = MAX_TEXT) =>
+  typeof value === "string" && value.length > max;
+
 export interface AppOptions {
   apiKey?: string;
   replayPerMinute?: number;
+  requestsPerMinute?: number;
 }
 
 export function createApp(pool: Pool, options: AppOptions = {}) {
   const apiKey = options.apiKey ?? config.apiKey;
   const auth = requireApiKey(apiKey);
-  const replayLimit = rateLimit(options.replayPerMinute ?? config.replayPerMinute);
+  const replayLimit = rateLimit(
+    options.replayPerMinute ?? config.replayPerMinute,
+    "too many replays, try again in a minute",
+  );
+  const overallLimit = rateLimit(
+    options.requestsPerMinute ?? config.requestsPerMinute,
+    "too many requests, try again in a minute",
+  );
+  const loadStats = microCache(1000, () => readStats(pool));
 
   const app = express();
+  app.disable("x-powered-by");
 
   // Open CORS: the dashboard is hosted on a different origin than the API, and
   // the API authenticates with a header rather than cookies.
@@ -81,11 +116,25 @@ export function createApp(pool: Pool, options: AppOptions = {}) {
     res.setHeader("access-control-allow-origin", "*");
     res.setHeader("access-control-allow-headers", "content-type,idempotency-key,authorization");
     res.setHeader("access-control-allow-methods", "GET,POST,OPTIONS");
+    // This API only serves JSON: nothing should sniff, frame or cache it.
+    res.setHeader("x-content-type-options", "nosniff");
+    res.setHeader("x-frame-options", "DENY");
+    res.setHeader("cache-control", "no-store");
     if (req.method === "OPTIONS") return res.sendStatus(204);
     next();
   });
+
+  // Liveness: is this process up? It must not touch the database, or a database
+  // blip would make the host restart a perfectly healthy process.
+  app.get("/live", (_req, res) => {
+    res.json({ ok: true });
+  });
+
+  // Above the health check so monitoring isn't locked out by a traffic spike.
+  app.use(overallLimit);
   app.use(express.json({ limit: "256kb" }));
 
+  // Readiness: can this process reach its database?
   app.get("/health", wrap(async (_req, res) => {
     await pool.query("SELECT 1");
     res.json({ ok: true });
@@ -94,13 +143,18 @@ export function createApp(pool: Pool, options: AppOptions = {}) {
   // --- endpoints ---------------------------------------------------------
   app.post("/endpoints", auth, wrap(async (req, res) => {
     const { url, name, secret, eventTypes } = req.body ?? {};
-    if (!isHttpUrl(url)) return res.status(400).json({ error: "url must be http(s)" });
-    if (name !== undefined && typeof name !== "string") {
-      return res.status(400).json({ error: "name must be a string" });
+    if (!isHttpUrl(url) || tooLong(url, MAX_URL)) {
+      return res.status(400).json({ error: "url must be http(s), at most 2048 characters" });
+    }
+    if (name !== undefined && (typeof name !== "string" || tooLong(name))) {
+      return res.status(400).json({ error: "name must be a string, at most 255 characters" });
+    }
+    if (secret !== undefined && (typeof secret !== "string" || secret.length === 0 || tooLong(secret))) {
+      return res.status(400).json({ error: "secret must be a non-empty string, at most 255 characters" });
     }
     if (
       eventTypes !== undefined &&
-      !(Array.isArray(eventTypes) && eventTypes.every((t) => typeof t === "string"))
+      !(Array.isArray(eventTypes) && eventTypes.every((t) => typeof t === "string" && !tooLong(t)))
     ) {
       return res.status(400).json({ error: "eventTypes must be an array of strings" });
     }
@@ -122,14 +176,14 @@ export function createApp(pool: Pool, options: AppOptions = {}) {
     const idempotencyKey =
       (req.header("idempotency-key") as string | undefined) ??
       req.body?.idempotencyKey;
-    if (typeof type !== "string" || type.length === 0) {
-      return res.status(400).json({ error: "type is required" });
+    if (typeof type !== "string" || type.length === 0 || tooLong(type)) {
+      return res.status(400).json({ error: "type is required, at most 255 characters" });
     }
     if (payload === undefined) {
       return res.status(400).json({ error: "payload is required" });
     }
-    if (idempotencyKey !== undefined && typeof idempotencyKey !== "string") {
-      return res.status(400).json({ error: "idempotency key must be a string" });
+    if (idempotencyKey !== undefined && (typeof idempotencyKey !== "string" || tooLong(idempotencyKey))) {
+      return res.status(400).json({ error: "idempotency key must be a string, at most 255 characters" });
     }
     const result = await ingestEvent(pool, { type, payload, idempotencyKey });
     // 202: accepted for asynchronous delivery. 200 for a repeated key.
@@ -161,7 +215,8 @@ export function createApp(pool: Pool, options: AppOptions = {}) {
     if (status && !STATUSES.includes(status)) {
       return res.status(400).json({ error: "bad status" });
     }
-    const limit = Math.min(Number(req.query.limit ?? 50) || 50, 200);
+    // Clamped: a negative LIMIT is a database error, not an empty list.
+    const limit = Math.max(1, Math.min(Math.floor(Number(req.query.limit ?? 50)) || 50, 200));
     const { rows } = await pool.query(
       `SELECT d.id, d.status, d.attempt_count AS "attemptCount",
               d.next_attempt_at AS "nextAttemptAt", d.last_error AS "lastError",
@@ -185,7 +240,7 @@ export function createApp(pool: Pool, options: AppOptions = {}) {
     const { rows } = await pool.query(
       `SELECT id, attempted_at AS "attemptedAt", status_code AS "statusCode",
               error, duration_ms AS "durationMs"
-         FROM attempts WHERE delivery_id = $1 ORDER BY id`,
+         FROM attempts WHERE delivery_id = $1 ORDER BY id LIMIT 500`,
       [id],
     );
     res.json(rows);
@@ -203,64 +258,7 @@ export function createApp(pool: Pool, options: AppOptions = {}) {
 
   // --- stats for the dashboard ------------------------------------------
   app.get("/stats", wrap(async (_req, res) => {
-    const byStatus = await pool.query(
-      `SELECT status, count(*)::int AS count FROM deliveries GROUP BY status`,
-    );
-    const latency = await pool.query(
-      `SELECT count(*)::int AS attempts,
-              coalesce(round(avg(duration_ms)), 0)::int AS "avgMs",
-              coalesce(percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms), 0)::int AS "p95Ms"
-         FROM attempts WHERE attempted_at > now() - interval '1 hour'`,
-    );
-    // One row per minute for the last 30 minutes, gaps filled with zeros, so
-    // the dashboard can plot event volume and attempt outcomes directly.
-    const timeline = await pool.query(
-      `WITH minutes AS (
-         SELECT generate_series(
-                  date_trunc('minute', now()) - interval '29 minutes',
-                  date_trunc('minute', now()),
-                  interval '1 minute') AS minute
-       ), ev AS (
-         SELECT date_trunc('minute', created_at) AS minute, count(*)::int AS n
-           FROM events WHERE created_at > now() - interval '30 minutes'
-          GROUP BY 1
-       ), att AS (
-         SELECT date_trunc('minute', attempted_at) AS minute,
-                count(*) FILTER (WHERE status_code BETWEEN 200 AND 299)::int AS ok,
-                count(*) FILTER (WHERE status_code IS NULL OR status_code NOT BETWEEN 200 AND 299)::int AS failed
-           FROM attempts WHERE attempted_at > now() - interval '30 minutes'
-          GROUP BY 1
-       )
-       SELECT m.minute,
-              coalesce(ev.n, 0)      AS events,
-              coalesce(att.ok, 0)     AS "okAttempts",
-              coalesce(att.failed, 0) AS "failedAttempts"
-         FROM minutes m
-         LEFT JOIN ev  ON ev.minute = m.minute
-         LEFT JOIN att ON att.minute = m.minute
-        ORDER BY m.minute`,
-    );
-    // Per-endpoint health: where are deliveries piling up?
-    const endpoints = await pool.query(
-      `SELECT ep.id, ep.name, ep.url,
-              count(d.*) FILTER (WHERE d.status = 'succeeded')::int AS succeeded,
-              count(d.*) FILTER (WHERE d.status IN ('pending','in_flight'))::int AS retrying,
-              count(d.*) FILTER (WHERE d.status = 'dead')::int AS dead
-         FROM endpoints ep
-         LEFT JOIN deliveries d ON d.endpoint_id = ep.id
-        GROUP BY ep.id
-        ORDER BY ep.created_at`,
-    );
-    const counts: Record<string, number> = {
-      pending: 0, in_flight: 0, succeeded: 0, dead: 0,
-    };
-    for (const r of byStatus.rows) counts[r.status] = r.count;
-    res.json({
-      deliveries: counts,
-      lastHour: latency.rows[0],
-      timeline: timeline.rows,
-      endpoints: endpoints.rows,
-    });
+    res.json(await loadStats());
   }));
 
   // Error handler: never leak internals.
@@ -280,4 +278,65 @@ export function createApp(pool: Pool, options: AppOptions = {}) {
   });
 
   return app;
+}
+
+async function readStats(pool: Pool) {
+  const byStatus = await pool.query(
+    `SELECT status, count(*)::int AS count FROM deliveries GROUP BY status`,
+  );
+  const latency = await pool.query(
+    `SELECT count(*)::int AS attempts,
+            coalesce(round(avg(duration_ms)), 0)::int AS "avgMs",
+            coalesce(percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms), 0)::int AS "p95Ms"
+       FROM attempts WHERE attempted_at > now() - interval '1 hour'`,
+  );
+  // One row per minute for the last 30 minutes, gaps filled with zeros, so
+  // the dashboard can plot event volume and attempt outcomes directly.
+  const timeline = await pool.query(
+    `WITH minutes AS (
+       SELECT generate_series(
+                date_trunc('minute', now()) - interval '29 minutes',
+                date_trunc('minute', now()),
+                interval '1 minute') AS minute
+     ), ev AS (
+       SELECT date_trunc('minute', created_at) AS minute, count(*)::int AS n
+         FROM events WHERE created_at > now() - interval '30 minutes'
+        GROUP BY 1
+     ), att AS (
+       SELECT date_trunc('minute', attempted_at) AS minute,
+              count(*) FILTER (WHERE status_code BETWEEN 200 AND 299)::int AS ok,
+              count(*) FILTER (WHERE status_code IS NULL OR status_code NOT BETWEEN 200 AND 299)::int AS failed
+         FROM attempts WHERE attempted_at > now() - interval '30 minutes'
+        GROUP BY 1
+     )
+     SELECT m.minute,
+            coalesce(ev.n, 0)      AS events,
+            coalesce(att.ok, 0)     AS "okAttempts",
+            coalesce(att.failed, 0) AS "failedAttempts"
+       FROM minutes m
+       LEFT JOIN ev  ON ev.minute = m.minute
+       LEFT JOIN att ON att.minute = m.minute
+      ORDER BY m.minute`,
+  );
+  // Per-endpoint health: where are deliveries piling up?
+  const endpoints = await pool.query(
+    `SELECT ep.id, ep.name, ep.url,
+            count(d.*) FILTER (WHERE d.status = 'succeeded')::int AS succeeded,
+            count(d.*) FILTER (WHERE d.status IN ('pending','in_flight'))::int AS retrying,
+            count(d.*) FILTER (WHERE d.status = 'dead')::int AS dead
+       FROM endpoints ep
+       LEFT JOIN deliveries d ON d.endpoint_id = ep.id
+      GROUP BY ep.id
+      ORDER BY ep.created_at`,
+  );
+  const counts: Record<string, number> = {
+    pending: 0, in_flight: 0, succeeded: 0, dead: 0,
+  };
+  for (const r of byStatus.rows) counts[r.status] = r.count;
+  return {
+    deliveries: counts,
+    lastHour: latency.rows[0],
+    timeline: timeline.rows,
+    endpoints: endpoints.rows,
+  };
 }

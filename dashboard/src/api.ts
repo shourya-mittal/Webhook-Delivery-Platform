@@ -1,7 +1,8 @@
 // Typed client for the platform API (see src/server.ts in the backend).
 // VITE_API_BASE is set only on the hosted demo, where the API is on another origin.
 export const IS_HOSTED_DEMO = Boolean(import.meta.env.VITE_API_BASE);
-const BASE = import.meta.env.VITE_API_BASE ?? "/api";
+// A trailing slash pasted into the setting would otherwise produce "//stats".
+const BASE = (import.meta.env.VITE_API_BASE ?? "/api").replace(/\/+$/, "");
 
 export type DeliveryStatus = "pending" | "in_flight" | "succeeded" | "dead";
 

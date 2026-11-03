@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type pg from "pg";
+import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { createApp } from "../src/server.js";
 import { createEndpoint, ingestEvent, replayDelivery } from "../src/events.js";
@@ -157,6 +158,41 @@ describe("failure paths", () => {
     // Both requests were really sent, so both are logged.
     const { rows } = await pool.query(`SELECT status_code FROM attempts ORDER BY id`);
     expect(rows.map((r) => r.status_code)).toEqual([500, 200]);
+  });
+
+  it("dead-letters a delivery whose workers keep dying instead of looping forever", async () => {
+    await createEndpoint(pool, { url: "http://127.0.0.1:1/unused" });
+    await ingestEvent(pool, { type: "t", payload: {} });
+
+    // Every worker claims it and "crashes": nobody ever settles it.
+    for (let i = 0; i < testConfig.maxAttempts; i++) {
+      expect(await claimDue(pool, testConfig)).toHaveLength(1);
+      await new Promise((r) => setTimeout(r, testConfig.leaseMs + 50));
+    }
+
+    expect(await claimDue(pool, testConfig)).toHaveLength(0);
+    expect((await deliveryStatus(pool)).status).toBe("dead");
+  });
+
+  it("does not follow redirects, and counts them as failures", async () => {
+    const target = await startReceiver();
+    const redirector = http.createServer((_req, res) => {
+      res.writeHead(302, { location: target.url });
+      res.end();
+    });
+    await new Promise<void>((r) => redirector.listen(0, "127.0.0.1", r));
+    const port = (redirector.address() as AddressInfo).port;
+    await createEndpoint(pool, { url: `http://127.0.0.1:${port}/hook` });
+    await ingestEvent(pool, { type: "t", payload: {} });
+
+    await processBatch(pool, testConfig);
+
+    expect(target.received).toHaveLength(0);
+    const { rows } = await pool.query(`SELECT status_code FROM attempts`);
+    expect(rows[0].status_code).toBe(302);
+    expect((await deliveryStatus(pool)).status).toBe("pending");
+    await new Promise((r) => redirector.close(r));
+    await target.close();
   });
 
   it("treats a receiver that is down (connection refused) as a failed attempt", async () => {

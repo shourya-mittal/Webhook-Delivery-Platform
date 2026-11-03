@@ -30,6 +30,16 @@ export async function claimDue(
   pool: Pool,
   cfg: Config = config,
 ): Promise<ClaimedDelivery[]> {
+  // A worker died during this delivery's last allowed attempt, so settle() never
+  // ran. Dead-letter it here, or a delivery that crashes every worker that
+  // touches it would be re-claimed forever.
+  await pool.query(
+    `UPDATE deliveries
+        SET status = 'dead', locked_until = NULL, updated_at = now(),
+            last_error = 'worker lost during final attempt (lease expired)'
+      WHERE status = 'in_flight' AND locked_until < now() AND attempt_count >= $1`,
+    [cfg.maxAttempts],
+  );
   const { rows } = await pool.query(
     `WITH due AS (
        SELECT id FROM deliveries
@@ -97,7 +107,13 @@ export async function sendRequest(
       },
       body,
       signal: AbortSignal.timeout(cfg.requestTimeoutMs),
+      // Never follow redirects: a receiver could bounce the signed request to an
+      // internal address. A 3xx is simply not a 2xx, so it counts as a failure.
+      redirect: "manual",
     });
+    // Only the status matters. Discard the body so a receiver can't make us hold
+    // the connection (or buffer a huge response) by sending a big one.
+    await res.body?.cancel().catch(() => {});
     const ok = res.status >= 200 && res.status < 300;
     return {
       ok,

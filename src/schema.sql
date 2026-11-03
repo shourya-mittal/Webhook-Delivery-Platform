@@ -2,7 +2,7 @@
 -- Design rule: an event is persisted (with its fan-out deliveries) in ONE
 -- transaction before any delivery is attempted. Nothing is "in memory only".
 
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+-- gen_random_uuid() is built in since PostgreSQL 13, so no extension is needed.
 
 CREATE TABLE IF NOT EXISTS endpoints (
   id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
