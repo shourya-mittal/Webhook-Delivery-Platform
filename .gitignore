@@ -1,4 +1,6 @@
 node_modules/
+# Project-local conda env (Node 22 + Postgres), see scripts/dev-env.ps1
+.tools/
 dist/
 coverage/
 .env
