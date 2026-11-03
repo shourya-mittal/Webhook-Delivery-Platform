@@ -9,6 +9,12 @@ dead-letter state, and an operator can replay them from a dashboard.
 Built from scratch in TypeScript, Node.js and PostgreSQL. Svix and Hookdeck
 Outpost were used only as architecture references.
 
+![Dashboard during a receiver outage: dead-lettered deliveries with one attempt log open](docs/images/dead-letter-attempt-log.png)
+
+*The dashboard during the school-bus demo, while the SMS gateway is down. Four
+deliveries ran out of retries and were dead-lettered. The open row shows each
+attempt the platform made. [Full demo walkthrough below.](#the-school-bus-demo)*
+
 ## Architecture
 
 PostgreSQL is both the store and the queue between the API and the workers,
@@ -105,12 +111,58 @@ Every fifth stop the bus "resends" the same event to show idempotency: the
 repeat creates no new deliveries. Each receiver verifies the HMAC signature
 the way a real one would.
 
-During an outage, watch SMS gateway deliveries turn **Retrying**, then
-**Dead-lettered** in the dashboard. When the gateway logs `UP` again, open the
-**Dead-lettered** tab and press **Replay**; the delivery goes back to the
-queue and succeeds. The demo uses a short retry policy (4 attempts, 1–8 s
-backoff, 3 s timeout) so the whole cycle takes seconds, and its own database
-(`webhook_demo`), which is wiped on every start. All data is simulated.
+The demo uses a short retry policy (4 attempts, 1–8 s backoff, 3 s timeout)
+so the whole cycle takes seconds, and its own database (`webhook_demo`),
+which is wiped on every start. All data is simulated.
+
+#### Walkthrough
+
+These screenshots are from an actual run of `npm run demo`.
+
+**1. The gateway goes down.** The bus keeps publishing. Parent notifications
+and the school office still get every event, but SMS gateway deliveries start
+failing. The chart's red segments are failed attempts. Rows show **Retrying**
+with a countdown to the next try, or **Sending** while a request is in flight.
+
+![Dashboard during the outage: failed attempts in the chart, retrying and dead-lettered rows](docs/images/dashboard-outage.png)
+
+The terminal shows the same thing from the receivers' side (excerpt from the same run). Other receivers
+are unaffected, a 500 from the school office is retried and recovers within a
+second, and the bus's resent event is recognised as a duplicate:
+
+```text
+2:40:46 am  sms-gateway    DOWN for 40s (503s and timeouts)
+2:40:50 am  bus-12         arrived at Willow Creek Rd → event 47b5f3fa
+2:40:50 am  school-office  47b5f3fa 200 ok  Willow Creek Rd
+2:40:50 am  parent-app     47b5f3fa 200 ok  Willow Creek Rd
+2:40:50 am  sms-gateway    47b5f3fa 503 failed
+2:40:50 am  sms-gateway    47b5f3fa 503 failed
+2:40:51 am  sms-gateway    47b5f3fa 503 failed
+2:40:57 am  sms-gateway    47b5f3fa … hanging (will time out)
+2:40:58 am  bus-12         resent same event (uplink retry) → duplicate=true, no new deliveries
+2:41:16 am  school-office  a3c3c91a 500 failed
+2:41:17 am  school-office  a3c3c91a 200 ok  Pine Grove Apartments
+2:41:26 am  sms-gateway    UP for 45s
+2:41:29 am  sms-gateway    47b5f3fa 200 ok  Willow Creek Rd
+```
+
+**2. Out of retries → dead-lettered.** After 4 failed attempts a delivery
+stops retrying and waits in the **Dead-lettered** tab. Its attempt log keeps
+every try: time, status code or error, and duration. This one got four 503s.
+(The image at the top of this README.)
+
+**3. Replay.** When the gateway logs `UP` again, press **Replay** on a
+dead-lettered delivery. It goes back to the queue and the worker delivers it
+on its next poll.
+
+![Dead-lettered tab after pressing Replay](docs/images/replay.png)
+
+**4. The replayed delivery's full history.** Event `47b5f3fa` failed with
+three 503s and a timeout, was dead-lettered, then was replayed and delivered
+with a 200. The same event id was sent every time, so a receiver that had
+already processed it could tell it was a repeat.
+
+![Attempt log of a replayed delivery: 503, 503, 503, timeout, then 200](docs/images/replayed-delivery-history.png)
 
 ### Full stack in Docker
 
