@@ -1,0 +1,36 @@
+# Local development stack: Postgres (store + queue) and the API/worker.
+#
+#   docker compose up -d db     # just Postgres, for `npm test` / `npm run dev`
+#   docker compose up --build   # Postgres + API/worker on :3000
+#
+# Postgres uses trust auth to match the password-less default DATABASE_URL in
+# src/config.ts. It is published on 127.0.0.1 only; do not use this setup
+# anywhere reachable from other machines.
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgres://postgres@db:5432/postgres
+      PORT: "3000"
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
